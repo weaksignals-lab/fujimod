@@ -14,6 +14,8 @@ pub(super) fn state<'py>(py: Python<'py>, saved: Snapshot) -> PyResult<Bound<'py
     out.set_item("returned", saved.returned)?;
     out.set_item("failure", saved.failure)?;
     out.set_item("accepted_instructions", saved.accepted_instructions)?;
+    out.set_item("mmio", saved.mmio)?;
+    out.set_item("dma_requests", saved.dma_requests)?;
     out.set_item("scope", saved.scope)?;
     Ok(out)
 }

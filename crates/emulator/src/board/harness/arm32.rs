@@ -426,6 +426,9 @@ impl Guard {
             returned: self.returned,
             failure: self.failure.clone(),
             accepted_instructions: self.accepted,
+            // Strict routine guards admit no devices or DMA.
+            mmio: Vec::new(),
+            dma_requests: Vec::new(),
             scope: "MMU-off little-endian A32 integer routine; explicit RAM ranges; no devices",
         }
     }
@@ -443,6 +446,8 @@ pub struct Snapshot {
     pub returned: bool,
     pub failure: Option<String>,
     pub accepted_instructions: u64,
+    pub mmio: Vec<(u64, u64)>,
+    pub dma_requests: Vec<(bool, u64, u64)>,
     pub scope: &'static str,
 }
 
