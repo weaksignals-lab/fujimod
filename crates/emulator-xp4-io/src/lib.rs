@@ -9,3 +9,5 @@ pub mod spi;
 pub mod system_control;
 pub mod temperature;
 pub mod usb_phy;
+
+pub mod configuration_request;
