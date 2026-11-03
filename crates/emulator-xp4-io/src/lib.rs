@@ -6,5 +6,6 @@ pub mod power_serial;
 pub mod requests;
 pub mod rtc;
 pub mod spi;
+pub mod system_control;
 pub mod temperature;
 pub mod usb_phy;

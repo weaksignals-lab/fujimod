@@ -956,6 +956,7 @@ impl Session {
             storage_dma_routes,
             spi_inputs,
             control_requests,
+            xp4_functional_system_control,
             storage_geometry,
             storage_irq,
             xpp_storage,
@@ -1474,6 +1475,11 @@ impl Session {
             devices
                 .get_or_insert_with(devices::Devices::empty)
                 .spi(base, miso)?;
+        }
+        if let Some(config) = xp4_functional_system_control {
+            devices
+                .get_or_insert_with(devices::Devices::empty)
+                .functional_system_control(config)?;
         }
         if !control_requests.is_empty() {
             devices
