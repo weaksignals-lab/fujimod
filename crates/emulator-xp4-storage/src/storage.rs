@@ -619,6 +619,7 @@ struct SidebandState {
 }
 pub const DMA_SIDEBAND: u64 = 0xfff4a800;
 pub struct DmaController {
+    receiver: Option<crate::tx_receiver::SharedReceiver>,
     sideband: Option<SidebandState>,
     port: Option<Shared>,
     standalone_admitted: bool,
@@ -630,7 +631,7 @@ pub struct DmaController {
 impl DmaController {
     pub fn new(port: Shared, routes: [u32; 16]) -> Self {
         Self {
-            port: Some(port), standalone_admitted: false, sideband: None,
+            receiver: None, port: Some(port), standalone_admitted: false, sideband: None,
             channels: Default::default(),
             routes,
             mux: BTreeMap::new(),
@@ -646,8 +647,12 @@ impl DmaController {
         {
             return Err("Invalid explicit standalone XP4 DMA profiles or IRQ routes".into());
         }
-        Ok(Self { port: None, standalone_admitted: false, sideband: None, channels: Default::default(), routes,
+        Ok(Self { receiver: None, port: None, standalone_admitted: false, sideband: None, channels: Default::default(), routes,
             mux: BTreeMap::new(), mux_changed: [0; 16] })
+    }
+    pub fn with_receiver(mut self, receiver: crate::tx_receiver::SharedReceiver) -> Self {
+        self.receiver = Some(receiver);
+        self
     }
     pub fn with_sideband(mut self, profile: Option<SidebandProfile>) -> Self {
         self.sideband = profile.map(|profile| SidebandState { profile, words: [[None; 2]; 16] });
@@ -700,6 +705,13 @@ impl DmaController {
         let dst = u64::from(c.regs[0x18 / 4]);
         let write = (FLASH..FLASH + FLASH_SIZE).contains(&dst);
         if !(FLASH..FLASH + FLASH_SIZE).contains(&src) && !write {
+            if c.regs[0x20 / 4] & 4 != 0 {
+                if let Some(receiver) = &self.receiver {
+                    let mux = *self.mux.get(&(0xfff4a500 + (n / 2) as u64 * 4)).unwrap_or(&0);
+                    let request = ((mux >> ((n % 2) * 8)) & 63) as u8;
+                    return receiver.lock().ok()?.ready_at(dst as u32, request, c.regs[4] as usize + 1).map(|at| at.max(c.submitted_at).max(self.mux_changed[n]));
+                }
+            }
             return Some(c.submitted_at);
         }
         let mux = *self
@@ -836,7 +848,7 @@ impl DmaController {
         if let Some(port) = &self.port { port.lock().unwrap().nor.check_mutation(dst, size)?; }
         let completed_at = c.due.unwrap();
         let program = (FLASH..FLASH + FLASH_SIZE).contains(&dst);
-        if c.regs[0x20 / 4] & 4 != 0 && !program {
+        if c.regs[0x20 / 4] & 4 != 0 && !program && self.receiver.is_none() {
             return Err("XP4 fixed-destination DMA is not modeled".into());
         }
         let data = if (FLASH..FLASH + FLASH_SIZE).contains(&src) {
@@ -863,7 +875,15 @@ impl DmaController {
         } else {
             cx.ram_bytes(src, size)?
         };
-        if program {
+        if !program && c.regs[0x20 / 4] & 4 != 0 {
+            if c.regs[0x1c / 4] != 0x20000 || c.regs[0x20 / 4] != 0x20004 || size % 4 != 0 {
+                return Err("Unsupported transmit word geometry".into());
+            }
+            let mux = *self.mux.get(&(0xfff4a500 + (n / 2) as u64 * 4)).unwrap_or(&0);
+            let request = ((mux >> ((n % 2) * 8)) & 63) as u8;
+            self.receiver.as_ref().ok_or("Missing transmit receiver")?.lock().map_err(|_| "Transmit receiver lock poisoned")?
+                .accept(completed_at, dst as u32, request, &data)?;
+        } else if program {
             let mut port = self.port.as_ref().ok_or("Standalone DMA cannot program serial flash")?.lock().unwrap();
             if c.regs[0x20 / 4] & 4 == 0
                 || port.program_data.is_some()
@@ -950,8 +970,10 @@ impl Device for DmaController {
                 cx.fail("Standalone XP4 DMA cannot wait for a missing serial-flash peer"); return;
             }
             if let Some(started) = self.ready_time(n) {
-                let at =
-                    started + 16 + (u64::from(self.channels[n].regs[0x10 / 4]) + 1).div_ceil(16);
+                let Some(at) = started.checked_add(16).and_then(|at| at.checked_add((u64::from(self.channels[n].regs[0x10 / 4]) + 1).div_ceil(16))) else {
+                    cx.fail("XP4 DMA deadline overflow");
+                    return;
+                };
                 self.channels[n].due = Some(at);
                 cx.schedule(at, n as u64);
             }
@@ -970,6 +992,7 @@ impl Device for DmaController {
     }
     fn save(&self) -> Value {
         let mut state = json!({"channels":self.channels.iter().map(|c|json!({"registers":c.regs.to_vec(),"next":c.due,"submitted":c.submitted,"submitted_at":c.submitted_at,"completed":c.completed})).collect::<Vec<_>>(),"irq_routes":self.routes,"request_mux":self.mux,"request_mux_changed":self.mux_changed});
+        if self.receiver.is_some() { state["transmit_receiver_connected"] = json!(true); }
         if self.port.is_none() {
             state["serial_flash_peer"] = json!(false);
             state["reset_profile"] = json!(Self::STANDALONE_RESET);
@@ -1904,6 +1927,51 @@ mod tests {
             results.push((dma.save(), host.ram, json!(host.records), host.events, host.irqs));
         }
         assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn transmit_receiver_waits_routes_and_retains_exact_words() {
+        use crate::tx_receiver::TxReceiver;
+        let receiver = Arc::new(Mutex::new(TxReceiver::new(0xfff30044, 22, 64).unwrap()));
+        let mut dma = standalone().with_receiver(receiver.clone());
+        let mut host = ram_host();
+        let expected = host.ram[0x100..0x120].to_vec();
+        for (offset, value) in [(0x14,0x100),(0x18,0xfff30044),(0x10,31),(0x1c,0x20000),(0x20,0x20004),(0x28,0x10000001)] {
+            write(&mut dma,&mut host,0,DMA+offset,value,0);
+        }
+        assert_eq!(dma.next_deadline(host.now), None);
+        receiver.lock().unwrap().offer(200,32).unwrap();
+        assert_eq!(dma.next_deadline(host.now), None); // selector zero is not22
+        host.now=250;
+        write(&mut dma,&mut host,0,0xfff4a500,0x10000|22,0);
+        dma.advance(&mut Cx::new(&mut host,0,0,0));
+        host.now=267; event(&mut dma,&mut host,0,0);
+        assert!(receiver.lock().unwrap().bytes().is_empty()); assert!(host.irqs.is_empty());
+        host.now=268; event(&mut dma,&mut host,0,0);
+        assert_eq!(receiver.lock().unwrap().bytes(),expected);
+        assert_eq!(dma.channels[0].regs[0x14/4],0x120);
+        assert_eq!(dma.channels[0].regs[0x18/4],0xfff30044);
+        assert_eq!(host.irqs,vec![(207,true)]);
+        event(&mut dma,&mut host,0,0);
+        assert_eq!(receiver.lock().unwrap().bytes(),expected);
+        let saved=dma.save(); assert!(dma.restore(&saved).is_err());
+        assert!(standalone().restore(&saved).is_err());
+    }
+
+    #[test]
+    fn transmit_receiver_deadline_overflow_has_no_effects() {
+        let receiver=Arc::new(Mutex::new(crate::tx_receiver::TxReceiver::new(0x1000,22,32).unwrap()));
+        receiver.lock().unwrap().offer(u64::MAX,32).unwrap();
+        let mut dma=standalone().with_receiver(receiver.clone()); let mut host=ram_host();
+        for (offset,value) in [(0x14,0x100),(0x18,0x1000),(0x10,31),(0x1c,0x20000),(0x20,0x20004),(0x28,0x10000001)] {
+            write(&mut dma,&mut host,0,DMA+offset,value,0);
+        }
+        write(&mut dma,&mut host,0,0xfff4a500,0x10000|22,0);
+        let mut cx=Cx::new(&mut host,0,0,0); dma.advance(&mut cx);
+        assert!(cx.take_refusal().is_some());
+        assert!(receiver.lock().unwrap().bytes().is_empty());
+        assert!(host.irqs.is_empty()); assert!(host.events.is_empty());
+        assert!(dma.channels[0].due.is_none());
     }
 
     fn protected_peer() -> Shared {
