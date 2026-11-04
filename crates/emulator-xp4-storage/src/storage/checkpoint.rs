@@ -136,6 +136,7 @@ impl SerialFlashController {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DmaState {
+    sideband: Option<SidebandState>,
     #[serde(default)]
     serial_flash_peer: Option<bool>,
     #[serde(default)]
@@ -162,7 +163,13 @@ impl DmaController {
             state.serial_flash_peer.unwrap_or(true) && state.reset_profile.is_none()
                 && state.timing_profile.is_none() && state.assumptions_recorded.is_none()
         };
-        if !mode_matches || state.irq_routes != self.routes
+        let sideband_matches = match (&self.sideband, &state.sideband) {
+            (None, None) => !value.as_object().is_some_and(|v| v.contains_key("sideband")),
+            (Some(expected), Some(actual)) => expected.profile == actual.profile
+                && actual.words.iter().flatten().all(|v| v.is_none() || *v == Some(0)),
+            _ => false,
+        };
+        if !sideband_matches || !mode_matches || state.irq_routes != self.routes
             || state.channels.len() != 16
             || state.channels.iter().any(|c| {
                 c.due.is_some_and(|at| !c.submitted || at < c.submitted_at)
@@ -178,6 +185,7 @@ impl DmaController {
         {
             return Err("Invalid XP4 DMA checkpoint or routes".into());
         }
+        self.sideband = state.sideband;
         self.standalone_admitted = state.assumptions_recorded.unwrap_or(false);
         self.channels = state
             .channels

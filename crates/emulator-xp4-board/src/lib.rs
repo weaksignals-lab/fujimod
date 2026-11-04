@@ -954,6 +954,7 @@ impl Session {
             timer_routes,
             storage_jedec,
             standalone_dma,
+            xp4_dma_sideband,
             storage_dma_routes,
             spi_inputs,
             control_requests,
@@ -1113,6 +1114,9 @@ impl Session {
             }
             None => None,
         };
+        if xp4_dma_sideband.is_some() && standalone_dma.is_none() && storage_jedec.is_none() {
+            return Err("XP4 DMA sideband requires an XP4 DMA owner".into());
+        }
         if standalone_dma.is_some() && (storage_jedec.is_some() || xpp_storage.is_some()) {
             return Err("Standalone XP4 DMA cannot be combined with a storage controller".into());
         }
@@ -1128,6 +1132,7 @@ impl Session {
                     .ok_or_else(|| "NOR requires explicit geometry and timing".to_owned())?,
                 storage_irq
                     .ok_or_else(|| "Serial flash requires an explicit IRQ route".to_owned())?,
+                xp4_dma_sideband,
             )?)
         } else if let Some(storage) = xpp_storage {
             if !storage_dma_routes.is_empty() || storage_geometry.is_some() || storage_irq.is_some()
@@ -1159,7 +1164,7 @@ impl Session {
             None
         };
         if let Some(input) = standalone_dma {
-            devices.get_or_insert_with(devices::Devices::empty).standalone_dma(input)?;
+            devices.get_or_insert_with(devices::Devices::empty).standalone_dma(input, xp4_dma_sideband)?;
         }
         let boot_wiring = xpp_boot.as_ref().map(|b| b.options.clone());
         if let Some(wiring) = &boot_wiring {

@@ -639,11 +639,12 @@ impl Devices {
         self.windows.push((base, base + 0x28, id));
         Ok(())
     }
-    pub fn standalone_dma(&mut self, input: super::definition::StandaloneDma) -> Result<(), String> {
+    pub fn standalone_dma(&mut self, input: super::definition::StandaloneDma, sideband: Option<storage::SidebandProfile>) -> Result<(), String> {
         let routes: [u32; 16] = input.irq_routes.try_into()
             .map_err(|_| "Standalone XP4 DMA requires 16 explicit IRQ routes")?;
-        let model = DmaController::standalone(routes, &input.reset_profile, &input.timing_profile)?;
-        let windows = [(storage::DMA, storage::DMA + 0x10000), (0xfff4a500, 0xfff4a520)];
+        let model = DmaController::standalone(routes, &input.reset_profile, &input.timing_profile)?.with_sideband(sideband);
+        let mut windows = vec![(storage::DMA, storage::DMA + 0x10000), (0xfff4a500, 0xfff4a520)];
+        if sideband.is_some() { windows.push((storage::DMA_SIDEBAND, storage::DMA_SIDEBAND + 0x80)); }
         if windows.iter().any(|&(a, b)| self.windows.iter().any(|&(lo, hi, _)| a < hi && lo < b)) {
             return Err("Overlapping standalone XP4 DMA window".into());
         }
@@ -658,6 +659,7 @@ impl Devices {
         image: Vec<u8>,
         geometry: (usize, usize, u64, u64),
         irq: u32,
+        sideband: Option<storage::SidebandProfile>,
     ) -> Result<Self, String> {
         let routes: [u32; 16] = routes
             .try_into()
@@ -681,7 +683,7 @@ impl Devices {
         Ok(Self {
             models: vec![
                 Some(Box::new(SerialFlashController::new(port.clone(), irq))),
-                Some(Box::new(DmaController::new(port, routes))),
+                Some(Box::new(DmaController::new(port, routes).with_sideband(sideband))),
             ],
             events: Default::default(),
             log: Vec::new(),
@@ -692,12 +694,16 @@ impl Devices {
             usb: None,
             frames: BTreeMap::new(),
             outputs: BTreeMap::new(),
-            windows: vec![
+            windows: {
+                let mut windows = vec![
                 (storage::CONTROLLER, storage::CONTROLLER + 0x100, 0),
                 (storage::FLASH, storage::FLASH + storage::FLASH_SIZE, 0),
                 (storage::DMA, storage::DMA + 0x10000, 1),
                 (0xfff4a500, 0xfff4a520, 1),
-            ],
+                ];
+                if sideband.is_some() { windows.push((storage::DMA_SIDEBAND, storage::DMA_SIDEBAND + 0x80, 1)); }
+                windows
+            },
         })
     }
     /// X-Processor Pro flash controller, its read aperture and the PL330 that

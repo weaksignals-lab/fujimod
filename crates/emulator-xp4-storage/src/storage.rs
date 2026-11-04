@@ -551,7 +551,22 @@ struct Channel {
     completed: u64,
     submitted_at: u64,
 }
+/// An explicit, unmeasured functional hypothesis. No readback or nonzero modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SidebandProfile {
+    #[serde(rename = "zero-writes-v1")]
+    ZeroWritesV1,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidebandState {
+    profile: SidebandProfile,
+    /// None means no write observed, not a reset value.
+    words: [[Option<u32>; 2]; 16],
+}
+pub const DMA_SIDEBAND: u64 = 0xfff4a800;
 pub struct DmaController {
+    sideband: Option<SidebandState>,
     port: Option<Shared>,
     standalone_admitted: bool,
     channels: [Channel; 16],
@@ -562,7 +577,7 @@ pub struct DmaController {
 impl DmaController {
     pub fn new(port: Shared, routes: [u32; 16]) -> Self {
         Self {
-            port: Some(port), standalone_admitted: false,
+            port: Some(port), standalone_admitted: false, sideband: None,
             channels: Default::default(),
             routes,
             mux: BTreeMap::new(),
@@ -578,8 +593,26 @@ impl DmaController {
         {
             return Err("Invalid explicit standalone XP4 DMA profiles or IRQ routes".into());
         }
-        Ok(Self { port: None, standalone_admitted: false, channels: Default::default(), routes,
+        Ok(Self { port: None, standalone_admitted: false, sideband: None, channels: Default::default(), routes,
             mux: BTreeMap::new(), mux_changed: [0; 16] })
+    }
+    pub fn with_sideband(mut self, profile: Option<SidebandProfile>) -> Self {
+        self.sideband = profile.map(|profile| SidebandState { profile, words: [[None; 2]; 16] });
+        self
+    }
+    fn sideband_write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        if size != 4 || address & 3 != 0 || value != 0 || self.sideband.is_none() {
+            cx.unmodeled(); return;
+        }
+        let state = self.sideband.as_mut().unwrap();
+        if state.words.iter().flatten().all(Option::is_none) {
+            cx.record(Record::new("XP4 DMA zero sideband experimental assumption", [
+                ("profile", Field::constant("zero-writes-v1")),
+                ("law", Field::constant("Accept zero writes only; hardware effects unmeasured; no readback, timing or IRQ effects")),
+            ]));
+        }
+        let word = ((address - DMA_SIDEBAND) / 4) as usize;
+        state.words[word / 2][word % 2] = Some(0);
     }
     fn admit(&mut self, cx: &mut Cx<'_>) {
         if self.port.is_some() || self.standalone_admitted { return; }
@@ -832,6 +865,9 @@ impl Device for DmaController {
         }
     }
     fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        if (DMA_SIDEBAND..DMA_SIDEBAND + 0x80).contains(&address) {
+            self.sideband_write(cx, address, size, value); return;
+        }
         if self.port.is_none() && value > u32::MAX as u64 {
             cx.fail("Standalone XP4 DMA requires a 32-bit value"); return;
         }
@@ -879,6 +915,9 @@ impl Device for DmaController {
             state["reset_profile"] = json!(Self::STANDALONE_RESET);
             state["timing_profile"] = json!(Self::STANDALONE_TIMING);
             state["assumptions_recorded"] = json!(self.standalone_admitted);
+        }
+        if let Some(sideband) = &self.sideband {
+            state["sideband"] = json!(sideband);
         }
         state
     }
@@ -1441,7 +1480,7 @@ mod tests {
     fn erase_and_dma_program_use_wel_wip_real_bytes_and_one_to_zero_bits() {
         assert_eq!(mutations(0x1234), mutations(0xabcdef));
     }
-    fn program_timing(late: bool) -> (Value, Value, Vec<Record>) {
+    fn program_timing(late: bool, sideband: bool) -> (Value, Value, Vec<Record>) {
         let p = port(
             vec![255; 8192],
             0,
@@ -1462,6 +1501,11 @@ mod tests {
             events: vec![],
             records: vec![],
         };
+        if sideband {
+            dma = dma.with_sideband(Some(SidebandProfile::ZeroWritesV1));
+            write(&mut dma,&mut h,1,DMA_SIDEBAND,0,0);
+            write(&mut dma,&mut h,1,DMA_SIDEBAND+4,0,0);
+        }
         write(&mut flash, &mut h, 0, CONTROLLER + 0x90, 0x06000001, 0);
         h.now = 108;
         event(&mut flash, &mut h, 0, 1);
@@ -1499,7 +1543,7 @@ mod tests {
     }
     #[test]
     fn peer_acceptance_dma_and_array_program_keep_their_deadlines_when_delivered_late() {
-        assert_eq!(program_timing(false), program_timing(true));
+        assert_eq!(program_timing(false,false), program_timing(true,false));
     }
     fn standalone() -> DmaController {
         DmaController::standalone(std::array::from_fn(|n| 207 + n as u32),
@@ -1513,6 +1557,103 @@ mod tests {
         for (offset, value) in [(0x14, src), (0x18, dst), (0x10, count - 1), (0x1c, source_config), (0x20, 0), (0x24, 0)] {
             write(dma, host, 0, DMA + offset, value, 0);
         }
+    }
+    #[test]
+    fn zero_sideband_keeps_serial_flash_bytes_state_and_deadlines() {
+        for late in [false,true] {
+            let expected=program_timing(late,false);
+            let (flash,mut dma,mut records)=program_timing(late,true);
+            dma.as_object_mut().unwrap().remove("sideband");
+            records.remove(0); // The sole additional event declares the sideband hypothesis.
+            assert_eq!((flash,dma,records),expected);
+        }
+    }
+    fn sideband_dma(coupled: bool) -> DmaController {
+        let dma = if coupled {
+            let peer = port(vec![], 0x20, Geometry { erase_bytes:65536, page_bytes:256, erase_ticks:100, page_ticks:10 }).unwrap();
+            DmaController::new(peer, std::array::from_fn(|n|207+n as u32))
+        } else { standalone() };
+        dma.with_sideband(Some(SidebandProfile::ZeroWritesV1))
+    }
+    #[test]
+    fn zero_sideband_all_channels_refuse_before_mutation_and_have_no_transfer_effects() {
+        for coupled in [false,true] {
+            let mut dma=sideband_dma(coupled); let mut host=ram_host();
+            let initial=dma.save(); let ram=host.ram.clone();
+            assert_eq!(initial["sideband"]["words"], json!(vec![[Option::<u32>::None;2];16]));
+            for word in 0..32 {
+                let address=DMA_SIDEBAND+word*4;
+                for (addr,size,value,read) in [(address,4,1,false),(address,4,1u64<<32,false),
+                    (address,1,0,false),(address,2,0,false),(address,8,0,false),
+                    (address+1,4,0,false),(address,4,0,true)] {
+                    let before=dma.save(); let records=host.records.len();
+                    let mut cx=Cx::new(&mut host,0,0,0);
+                    if read { dma.read(&mut cx,addr,size); } else { dma.write(&mut cx,addr,size,value); }
+                    assert!(cx.refusal().is_some(), "{addr:x} {size} {value}");
+                    assert_eq!(dma.save(),before); assert_eq!(host.records.len(),records);
+                }
+                write(&mut dma,&mut host,0,address,0,0x12345678);
+            }
+            assert_eq!(dma.save()["sideband"]["words"],json!(vec![[Some(0u32);2];16]));
+            let mut after=dma.save(); after.as_object_mut().unwrap().remove("sideband");
+            let mut before=initial; before.as_object_mut().unwrap().remove("sideband"); assert_eq!(after,before);
+            assert_eq!(host.ram,ram); assert!(host.events.is_empty() && host.irqs.is_empty());
+            assert_eq!(dma.next_deadline(host.now),None); assert_eq!(host.records.len(),1);
+            for address in [DMA_SIDEBAND-4,DMA_SIDEBAND+0x80] {
+                let before=dma.save(); let mut cx=Cx::new(&mut host,0,0,0);
+                dma.write(&mut cx,address,4,0); assert!(cx.refusal().is_some()); assert_eq!(dma.save(),before);
+            }
+            dma.sideband=None;
+            let before=dma.save(); let mut cx=Cx::new(&mut host,0,0,0);
+            dma.write(&mut cx,DMA_SIDEBAND,4,0); assert!(cx.refusal().is_some()); assert_eq!(dma.save(),before);
+        }
+    }
+    #[test]
+    fn zero_sideband_checkpoint_binds_profile_presence_and_exact_shape_atomically() {
+        for coupled in [false,true] {
+            let mut dma=sideband_dma(coupled); let mut host=ram_host();
+            write(&mut dma,&mut host,0,DMA_SIDEBAND+0x7c,0,0);
+            let state=dma.save(); let mut restored=sideband_dma(coupled); restored.restore(&state).unwrap();
+            assert_eq!(restored.save(),state);
+            let mut without=state.clone(); without.as_object_mut().unwrap().remove("sideband");
+            let mut null=state.clone(); null["sideband"]=Value::Null;
+            let mut bad_profile=state.clone(); bad_profile["sideband"]["profile"]=json!("unproven");
+            let mut bad_value=state.clone(); bad_value["sideband"]["words"][0][0]=json!(1);
+            let mut bad_shape=state.clone(); bad_shape["sideband"]["words"]=json!([[null,null]]);
+            let mut bad_word=state.clone(); bad_word["sideband"]["words"][0]=json!([null]);
+            let mut bad_field=state.clone(); bad_field["sideband"]["extra"]=json!(0);
+            for bad in [without.clone(),null,bad_profile,bad_value,bad_shape,bad_word,bad_field] {
+                let before=restored.save(); assert!(restored.restore(&bad).is_err()); assert_eq!(restored.save(),before);
+            }
+            restored.sideband=None; let before=restored.save();
+            assert!(restored.restore(&state).is_err()); assert_eq!(restored.save(),before);
+            restored.restore(&without).unwrap();
+            let mut explicit_null=without; explicit_null["sideband"]=Value::Null;
+            assert!(restored.restore(&explicit_null).is_err());
+        }
+    }
+    #[test]
+    fn zero_sideband_is_independent_of_pc_core_time_and_keeps_copy_fill_results() {
+        for coupled in [false,true] { for fixed in [false,true] {
+            let mut results=vec![];
+            for (cpu,pc,now) in [(0,0,100),(3,0xdeadbeef,900)] {
+                let mut dma=sideband_dma(coupled); let mut host=ram_host(); host.now=now;
+                for address in [DMA_SIDEBAND,DMA_SIDEBAND+4] {
+                    let mut cx=Cx::new(&mut host,cpu,pc,0); dma.write(&mut cx,address,4,0);
+                    assert!(cx.refusal().is_none());
+                }
+                configure_ram(&mut dma,&mut host,0x100,0x300,32,if fixed {0x20004}else{0});
+                write(&mut dma,&mut host,cpu,DMA+0x28,0x10000001,pc);
+                dma.advance(&mut Cx::new(&mut host,cpu,pc,0));
+                assert_eq!(dma.next_deadline(now),Some(now+18));
+                host.now+=18; event(&mut dma,&mut host,cpu,0);
+                let expected=if fixed { host.ram[0x100..0x104].iter().copied().cycle().take(32).collect::<Vec<_>>() }
+                    else { (0..32).map(|v|v as u8).collect() };
+                assert_eq!(&host.ram[0x300..0x320],expected.as_slice());
+                results.push((host.ram,host.irqs,dma.save()["sideband"].clone()));
+            }
+            assert_eq!(results[0],results[1]);
+        }}
     }
     #[test]
     fn standalone_original_sixteen_channel_initialization_has_no_transfer_or_irq() {

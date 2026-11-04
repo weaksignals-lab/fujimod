@@ -41,3 +41,30 @@ fn profiles_routes_and_storage_controller_exclusion_are_explicit() {
     let error = Session::new(serde_json::from_value(v).unwrap(), None, vec![]).err().unwrap();
     assert!(error.contains("cannot be combined"), "{error}");
 }
+
+#[test]
+fn sideband_requires_owner_and_claims_only_explicit_window() {
+    let mut v = input(); v["xp4_dma_sideband"] = json!("zero-writes-v1");
+    let error = Session::new(serde_json::from_value(v.clone()).unwrap(), None, vec![]).err().unwrap();
+    assert!(error.contains("requires an XP4 DMA owner"), "{error}");
+    for coupled in [false, true] {
+        let mut owned = v.clone();
+        if coupled {
+            owned["storage_jedec"] = json!(0x20); owned["storage_dma_routes"] = json!((207..223).collect::<Vec<_>>());
+            owned["storage_geometry"] = json!([65536,256,100,10]); owned["storage_irq"] = json!(37);
+        } else { owned["standalone_dma"] = dma(); }
+        let board = Session::new(serde_json::from_value(owned.clone()).unwrap(), None, vec![]).unwrap();
+        let state: Value = serde_json::from_str(&board.device_state_json()["xp4-dma"]).unwrap();
+        assert_eq!(state["sideband"]["profile"], "zero-writes-v1");
+        assert_eq!(state["sideband"]["words"], json!(vec![[Option::<u32>::None;2];16]));
+        for address in [0xfff4a800u64, 0xfff4a87c] {
+            let mut conflict = owned.clone(); conflict["control_requests"] = json!([[address,4]]);
+            assert!(Session::new(serde_json::from_value(conflict).unwrap(), None, vec![]).is_err());
+        }
+        owned.as_object_mut().unwrap().remove("xp4_dma_sideband");
+        owned["control_requests"] = json!([[0xfff4a800u64,4]]);
+        assert!(Session::new(serde_json::from_value(owned).unwrap(), None, vec![]).is_ok());
+    }
+    v["xp4_dma_sideband"] = json!("generic");
+    assert!(serde_json::from_value::<Definition>(v).is_err());
+}

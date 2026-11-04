@@ -39,6 +39,9 @@ pub struct Definition {
     /// DMA-only connection with explicitly declared reset and timing hypotheses.
     #[serde(default)]
     pub standalone_dma: Option<StandaloneDma>,
+    /// Optional zero-write sideband hypothesis; requires an XP4 DMA owner.
+    #[serde(default)]
+    pub xp4_dma_sideband: Option<fujimod_emulator_xp4_storage::storage::SidebandProfile>,
     #[serde(default)]
     pub storage_dma_routes: Vec<u32>,
     #[serde(default)]
