@@ -218,6 +218,7 @@ impl Devices {
         active_high: bool,
         inputs: BTreeMap<u8, u16>,
         rtc_ticks: u64,
+        command_output: Option<fujimod_emulator_xp4_io::power_serial::ExactCommandOutput>,
     ) -> Result<(), String> {
         let pins = self
             .pins
@@ -232,6 +233,7 @@ impl Devices {
             idle,
             inputs,
             rtc_ticks,
+            command_output,
         )?;
         self.spi_input(base, Box::new(part))
     }
