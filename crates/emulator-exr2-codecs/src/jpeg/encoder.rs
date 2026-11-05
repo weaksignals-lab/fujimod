@@ -5,7 +5,7 @@
 //! with status 0x20 instead of READY (0x10), count 0 and no RAM write.
 use fujimod_emulator_devices::exr2::irq_routes::Irq;
 use fujimod_emulator_devices::{Cx, Device};
-use fujimod_emulator_image_codecs::jpeg::{Codec, OUTPUT_OVERFLOW};
+use fujimod_emulator_image_codecs::jpeg::{Codec, Packed422Layout, OUTPUT_OVERFLOW};
 use fujimod_emulator_imaging::exr2_isp::{
     dma::{Transfer, physical},
     due,
@@ -124,8 +124,13 @@ impl Encoder {
         }
         let streaming = r[0x120 / 4] == 2;
         let restart = r[0x80 / 4] as u16;
+        let layout = Packed422Layout {
+            width: w,
+            height: h,
+            stride_bytes: w * 2,
+        };
         self.codec
-            .validate(w * h * 2, w, h, restart, capacity - 2)?;
+            .validate(w * h * 2, layout, restart, capacity - 2)?;
         let input = if streaming {
             let mut s = self.stream.lock().unwrap();
             Some(s.claim(w, h)?)
@@ -157,7 +162,7 @@ impl Encoder {
                     Some(input) => input.bytes()?,
                     None => &source,
                 };
-                codec.encode(pixels, w, h, restart, &mut out, capacity - 2)
+                codec.encode(pixels, layout, restart, &mut out, capacity - 2)
             })();
             if result.is_ok() {
                 out.splice(0..0, [0xff, 0xd8]);

@@ -9,6 +9,15 @@ use tables::*;
 /// Entropy output reached the destination capacity. Owners decide how the
 /// hardware reports it; it is not a refusal of the request.
 pub const OUTPUT_OVERFLOW: &str = "JPEG output exceeds capacity";
+const MAX_SOURCE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Row layout for Y0/Y1/Cb/Cr pixel pairs, with optional trailing padding.
+#[derive(Clone, Copy, Debug)]
+pub struct Packed422Layout {
+    pub width: usize,
+    pub height: usize,
+    pub stride_bytes: usize,
+}
 
 fn round(v: i32, s: u32) -> i32 {
     (v + (1 << (s - 1))) >> s
@@ -285,16 +294,26 @@ impl Codec {
         }
         Ok(())
     }
-    /// Validate geometry, tables and the minimum header allocation without
-    /// reading image bytes or running the transform/entropy kernel.
+    /// Validate geometry, row stride, tables and the minimum header allocation
+    /// without reading image bytes or running the transform/entropy kernel.
+    /// The source contains complete rows, including the final row's padding.
+    /// Padding counts toward the 128 MiB source bound.
     pub fn validate(
         &self,
         source_bytes: usize,
-        width: usize,
-        height: usize,
+        layout: Packed422Layout,
         restart: u16,
         capacity: usize,
     ) -> Result<(), String> {
+        let Packed422Layout {
+            width,
+            height,
+            stride_bytes,
+        } = layout;
+        let row_bytes = width.checked_mul(2).ok_or("JPEG row size overflow")?;
+        let span = stride_bytes
+            .checked_mul(height)
+            .ok_or("JPEG source span overflow")?;
         if width < 16
             || !width.is_multiple_of(16)
             || height < 8
@@ -302,7 +321,9 @@ impl Codec {
             || width > 65535
             || height > 65535
             || width * height > 32_000_000
-            || source_bytes != width * height * 2
+            || stride_bytes < row_bytes
+            || span > MAX_SOURCE_BYTES
+            || source_bytes != span
             || self.uploaded.contains(&0)
             || capacity == 0
             || capacity > 64 * 1024 * 1024
@@ -322,18 +343,23 @@ impl Codec {
             restart,
         )
     }
-    /// DHT..EOI, excluding SOI/reserved bytes. Pure serial kernel; the owning
-    /// device chooses when and where to execute it.
+    /// DHT..EOI, excluding SOI/reserved bytes, from Y0/Y1/Cb/Cr pixel pairs.
+    /// Row padding is present in the source but never sampled. Pure serial
+    /// kernel; the owning device chooses when and where to execute it.
     pub fn encode(
         &self,
         source: &[u8],
-        width: usize,
-        height: usize,
+        layout: Packed422Layout,
         restart: u16,
         output: &mut Vec<u8>,
         capacity: usize,
     ) -> Result<(), String> {
-        self.validate(source.len(), width, height, restart, capacity)?;
+        self.validate(source.len(), layout, restart, capacity)?;
+        let Packed422Layout {
+            width,
+            height,
+            stride_bytes,
+        } = layout;
         output.resize(capacity, 0);
         let mut w = Writer {
             out: output,
@@ -362,7 +388,8 @@ impl Codec {
                         } else {
                             i % 8 * 2
                         };
-                    let at = (y * width + x) / 2 * 4 + if c == 0 { x % 2 } else { c + 1 };
+                    let at =
+                        y * stride_bytes + x / 2 * 4 + if c == 0 { x % 2 } else { c + 1 };
                     source[at] as i32 - 128
                 });
                 self.block(&mut w, pixels, c, &mut prev[c])?;
@@ -408,6 +435,15 @@ pub fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(width: usize, height: usize, stride_bytes: usize) -> Packed422Layout {
+        Packed422Layout {
+            width,
+            height,
+            stride_bytes,
+        }
+    }
+
     #[test]
     fn constant_dct_is_dc_only() {
         for v in [-128, -1, 0, 1, 127] {
@@ -421,7 +457,7 @@ mod tests {
         let mut c = Codec::default();
         c.tables(&[3; 128]).unwrap();
         let mut out = Vec::new();
-        c.encode(&vec![128; 80 * 8 * 2], 80, 8, 4, &mut out, 4096)
+        c.encode(&vec![128; 80 * 8 * 2], layout(80, 8, 160), 4, &mut out, 4096)
             .unwrap();
         assert_eq!(&out[..2], &[255, 0xc4]);
         assert_eq!(&out[out.len() - 2..], &[255, 0xd9]);
@@ -436,7 +472,9 @@ mod tests {
         let rgb = d.decode().unwrap();
         assert_eq!(rgb.len(), 80 * 8 * 3);
         assert!(rgb.iter().all(|&v| (127..=129).contains(&v)));
-        assert!(c.encode(&vec![0; 256], 16, 8, 0, &mut out, 16).is_err());
+        assert!(c
+            .encode(&vec![0; 256], layout(16, 8, 32), 0, &mut out, 16)
+            .is_err());
         assert!(c.tables(&[0; 128]).is_err());
         let (ycc, width, height) = decode(&encoded, 80, 8).unwrap();
         assert_eq!((width, height, ycc.len()), (80, 8, 80 * 8 * 3));
@@ -445,5 +483,120 @@ mod tests {
                 .all(|p| p.iter().all(|&v| (127..=129).contains(&v)))
         );
         assert!(decode(&encoded, 64, 8).is_err());
+    }
+
+    #[test]
+    fn padded_rows_preserve_stream_restarts_and_component_samples() {
+        let (width, height) = (80, 24);
+        let row_bytes = width * 2;
+        let stride = row_bytes + 3;
+        let mut dense = Vec::new();
+        for y in 0..height {
+            for x in (0..width).step_by(2) {
+                let luma = 32 + (x / 8) * 8 + (y / 8) * 40;
+                dense.extend_from_slice(&[
+                    luma as u8,
+                    (luma + 8) as u8,
+                    (80 + (y / 8) * 16) as u8,
+                    (160 - (y / 8) * 16) as u8,
+                ]);
+            }
+        }
+        let mut padded = vec![0xa5; stride * height];
+        for (source, target) in dense
+            .chunks_exact(row_bytes)
+            .zip(padded.chunks_exact_mut(stride))
+        {
+            target[..row_bytes].copy_from_slice(source);
+        }
+        let mut codec = Codec::default();
+        codec.tables(&[3; 128]).unwrap();
+        let mut expected = Vec::new();
+        codec
+            .encode(&dense, layout(width, height, row_bytes), 3, &mut expected, 8192)
+            .unwrap();
+        for padding in [0xa5, 0x5a] {
+            for row in padded.chunks_exact_mut(stride) {
+                row[row_bytes..].fill(padding);
+            }
+            let before = padded.clone();
+            let mut actual = Vec::new();
+            codec
+                .encode(&padded, layout(width, height, stride), 3, &mut actual, 8192)
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(padded, before);
+        }
+        assert!(expected.windows(6).any(|v| v == [0xff, 0xdd, 0, 4, 0, 3]));
+        let restarts: Vec<_> = expected
+            .windows(2)
+            .filter(|v| v[0] == 0xff && (0xd0..=0xd7).contains(&v[1]))
+            .map(|v| v[1])
+            .collect();
+        assert_eq!(restarts, [0xd0, 0xd1, 0xd2, 0xd3]);
+        let mut stream = vec![0xff, 0xd8];
+        stream.extend_from_slice(&expected);
+        let (samples, w, h) = decode(&stream, width, height).unwrap();
+        assert_eq!((w, h), (width, height));
+        for y in 0..height {
+            for x in 0..width {
+                let pair = (y * width + x) / 2 * 4;
+                let wanted = [dense[pair + x % 2], dense[pair + 2], dense[pair + 3]];
+                for (actual, wanted) in samples[(y * width + x) * 3..][..3].iter().zip(wanted) {
+                    assert!(
+                        (i16::from(*actual) - i16::from(wanted)).abs() <= 2,
+                        "sample ({x},{y}): {actual} != {wanted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_row_spans_leave_output_unchanged() {
+        let mut codec = Codec::default();
+        codec.tables(&[3; 128]).unwrap();
+        let original = vec![0x91, 0x27, 0x63];
+        // A minimally addressed last row is deliberately insufficient: this
+        // API requires the complete final row, including its padding.
+        for (width, height, stride, len) in [
+            (16, 8, 0, 256),
+            (16, 8, 31, 248),
+            (16, 8, 35, 277),
+            (16, 8, 35, 279),
+            (16, 8, 35, 281),
+            (16, 8, usize::MAX, 256),
+            (usize::MAX, 8, 32, 256),
+            (16, usize::MAX, 32, 256),
+            (16, 8, MAX_SOURCE_BYTES / 8 + 1, 256),
+        ] {
+            let mut output = original.clone();
+            assert!(
+                codec
+                    .encode(
+                        &vec![128; len],
+                        layout(width, height, stride),
+                        0,
+                        &mut output,
+                        4096,
+                    )
+                    .is_err(),
+                "accepted {width}x{height}, stride {stride}, length {len}"
+            );
+            assert_eq!(output, original);
+        }
+        assert!(codec
+            .validate(
+                MAX_SOURCE_BYTES + 8,
+                layout(16, 8, MAX_SOURCE_BYTES / 8 + 1),
+                0,
+                4096,
+            )
+            .is_err());
+        let mut output = Vec::new();
+        codec
+            .encode(&vec![128; 280], layout(16, 8, 35), 0, &mut output, 4096)
+            .unwrap();
+        assert!(!output.is_empty());
     }
 }

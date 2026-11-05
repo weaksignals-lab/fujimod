@@ -14,6 +14,7 @@ pub struct Guard {
     pub returned: bool,
     pub failure: Option<String>,
     accepted: u64,
+    mmio: Vec<Span>,
 }
 
 fn contains(spans: &[Span], address: u64, size: u64) -> bool {
@@ -143,7 +144,17 @@ impl Guard {
             returned: false,
             failure: None,
             accepted: 0,
+            mmio: Vec::new(),
         })
+    }
+
+    /// Admit connected device registers separately from physical RAM.
+    pub fn admit_mmio(&mut self, windows: Vec<Span>) -> Result<(), String> {
+        let windows = spans(windows, &[(0, 1 << 32)])?;
+        if windows.iter().any(|&(a,b)| self.executable.iter().chain(&self.readable).chain(&self.writable).any(|&(lo,hi)| a < hi && lo < b) || (a < self.return_address+4 && self.return_address < b)) {
+            return Err("Driver MMIO overlaps declared RAM or code".into());
+        }
+        self.mmio = windows; Ok(())
     }
 
     pub fn stopped(&self) -> bool {
@@ -399,7 +410,7 @@ impl Guard {
             } else {
                 &self.readable
             };
-            if !contains(allowed, address, size) {
+            if !contains(allowed, address, size) && !contains(&self.mmio, address, size) {
                 return Err(format!(
                     "Driver guard rejected {} at {address:#x} size={size} pc={pc:#x}",
                     if write { "write" } else { "read" }
@@ -426,10 +437,9 @@ impl Guard {
             returned: self.returned,
             failure: self.failure.clone(),
             accepted_instructions: self.accepted,
-            // Strict routine guards admit no devices or DMA.
-            mmio: Vec::new(),
+            mmio: self.mmio.clone(),
             dma_requests: Vec::new(),
-            scope: "MMU-off little-endian A32 integer routine; explicit RAM ranges; no devices",
+            scope: "MMU-off little-endian A32 integer routine; explicit RAM and connected MMIO ranges",
         }
     }
 }

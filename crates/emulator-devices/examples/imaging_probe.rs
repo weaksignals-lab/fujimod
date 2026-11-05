@@ -1,6 +1,6 @@
 //! Offline pixel-law probe. No CPU, device state, completion, or firmware substitution.
 use fujimod_emulator_imaging::film::Film;
-use fujimod_emulator_image_codecs::jpeg::{Codec, fdct};
+use fujimod_emulator_image_codecs::jpeg::{Codec, Packed422Layout, fdct};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -55,11 +55,15 @@ fn probe(request: Request) -> Result<serde_json::Value, String> {
         } => {
             let mut codec = Codec::default();
             codec.tables(&tables)?;
+            let stride_bytes = width.checked_mul(2).ok_or("JPEG row size overflow")?;
             let mut output = Vec::new();
             codec.encode(
                 &pixels,
-                width,
-                height,
+                Packed422Layout {
+                    width,
+                    height,
+                    stride_bytes,
+                },
                 restart,
                 &mut output,
                 64 * 1024 * 1024,
@@ -74,4 +78,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", probe(request).map_err(io::Error::other)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jpeg_row_overflow_returns_an_error() {
+        assert_eq!(
+            probe(Request::Jpeg {
+                pixels: Vec::new(),
+                width: usize::MAX,
+                height: 8,
+                tables: vec![3; 128],
+                restart: 0,
+            }),
+            Err("JPEG row size overflow".into())
+        );
+    }
 }

@@ -36,6 +36,7 @@ members = [
   "crates/emulator-models",
   "crates/emulator-exr2-boot-serial",
   "crates/emulator-xp4-board",
+  "crates/emulator-xp4-codecs",
   "crates/emulator-imaging",
   "crates/emulator-image-formation",
   "crates/emulator-image-processing",
@@ -120,6 +121,7 @@ repository = "https://github.com/justjake/fujimod"
 publish = false
 
 [workspace.dependencies]
+fujimod-emulator-xp4-codecs = { path = "crates/emulator-xp4-codecs", version = "0.1.0" }
 fujimod-remote = { path = "crates/remote", version = "0.1.0" }
 fujimod-recording = { path = "crates/recording", version = "0.1.0" }
 fujimod-catalog = { path = "crates/catalog", version = "0.1.0" }

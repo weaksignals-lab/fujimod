@@ -30,7 +30,7 @@
 //! = 4); that path is not modeled and fails. 4:2:2 output for a 4:2:0
 //! stream is not checked against the camera.
 use fujimod_emulator_devices::{Cx, Device};
-use fujimod_emulator_image_codecs::jpeg::{Codec, decode};
+use fujimod_emulator_image_codecs::jpeg::{Codec, Packed422Layout, decode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -98,7 +98,17 @@ impl Encoder {
         };
         let source = cx.ram_bytes(self.word(SOURCE).into(), width * height * 2)?;
         let mut body = Vec::new();
-        codec.encode(&source, width, height, restart, &mut body, limit - 2)?;
+        codec.encode(
+            &source,
+            Packed422Layout {
+                width,
+                height,
+                stride_bytes: width * 2,
+            },
+            restart,
+            &mut body,
+            limit - 2,
+        )?;
         let mut stream = vec![0xff, 0xd8];
         stream.extend_from_slice(&body);
         cx.ram_write(self.word(DESTINATION).into(), &stream)?;

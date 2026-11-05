@@ -3,11 +3,13 @@
 mod abort;
 mod client;
 mod definition;
+pub mod maintenance;
 pub mod memory;
-pub use definition::Definition;
+pub use definition::{Definition, GicCpuInitial, GicInitial, NorImmutablePrefix};
 pub mod observation;
 use observation::Call;
 mod devices;
+mod driver_dma;
 mod timer;
 use fujimod_emulator::board::discovery::Discovery;
 use fujimod_emulator::board::harness::arm32 as driver_guard;
@@ -16,7 +18,7 @@ use fujimod_emulator_cpu::{
     self as cpu, Access, Cpu, ExecutionError, Exit, Fault, Hook as CpuHook, HookRange, Register,
     Run, arm, memory::Backing,
 };
-use fujimod_emulator_cpu_unicorn::Library;
+use fujimod_emulator_cpu_unicorn::{Core, Library};
 use fujimod_emulator_ip_arm::gicv2::Gic;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
@@ -39,6 +41,13 @@ struct Running<'a>(&'a Cell<bool>);
 impl Drop for Running<'_> {
     fn drop(&mut self) {
         self.0.set(false);
+    }
+}
+
+struct Observing<'a>(&'a Cell<Option<usize>>);
+impl Drop for Observing<'_> {
+    fn drop(&mut self) {
+        self.0.set(None);
     }
 }
 
@@ -85,14 +94,17 @@ struct RunState {
     remap_pending: bool,
     remap_ready: bool,
     driver_guard: Option<driver_guard::Guard>,
+    driver_dma: Option<driver_dma::Policy>,
 }
 
 struct Cluster {
     // Destroy processors before their RAM backing and callback contexts.
-    cpus: Vec<Box<dyn Cpu>>,
+    cpus: Vec<Core>,
+    maintenance: maintenance::Maintenance,
     ram: Backing,
     dram_alias: Option<u64>,
     memory: Vec<memory::Window>,
+    frozen_nor: Option<fujimod_emulator_xp4_storage::storage::ImmutableView>,
     hooks: Vec<Box<Hook>>,
     labels: Vec<u32>,
     cbar: Option<u32>,
@@ -100,10 +112,45 @@ struct Cluster {
     cache_ids: Option<[u32; 3]>,
     instruction_rate: fujimod_emulator_cpu::timeline::Ratio,
     running: Cell<bool>,
+    observer_core: Cell<Option<usize>>,
     pc_handler: RefCell<Option<InstructionObserver>>,
     state: UnsafeCell<RunState>,
 }
 impl Cluster {
+    fn healthy(&self) -> Result<(), String> {
+        match unsafe { &(*self.state.get()).failure } {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn host_mutation(&self) -> Result<(), String> {
+        self.healthy()?;
+        if self.running.get() {
+            return Err("Mutation requires a paused ARMv7-A board".into());
+        }
+        self.maintenance.ready(&self.cpus)
+            .map_err(|error| self.retain_failure(error))?;
+        Ok(())
+    }
+
+    fn host_register_mutation(&self, core: usize) -> Result<(), String> {
+        self.healthy()?;
+        self.cpu(core)?;
+        if self.running.get() {
+            if self.observer_core.get() != Some(core) {
+                return Err("Live register mutation requires the current core's instruction observer".into());
+            }
+            Ok(())
+        } else {
+            self.host_mutation()
+        }
+    }
+
+    fn retain_failure(&self, error: String) -> String {
+        unsafe { (*self.state.get()).failure.get_or_insert(error).clone() }
+    }
+
     fn record_memory(&self, core: usize, access: Access, address: u64, size: i32, value: i64) {
         if unsafe { (*self.state.get()).memory_watch.is_none() } {
             return;
@@ -201,10 +248,11 @@ impl Cluster {
         &self,
         action: impl FnOnce(&mut devices::Devices, u64) -> Result<T, String>,
     ) -> Result<T, String> {
+        self.host_mutation()?;
         if unsafe { (*self.state.get()).driver_guard.is_some() } {
             return Err("Guarded routine cannot change external device inputs".into());
         }
-        self.devices_due()?;
+        self.devices_due().map_err(|error| self.retain_failure(error))?;
         let state = unsafe { &mut *self.state.get() };
         let now = state.ticks;
         let mut devices = state.devices.take().ok_or("A7 devices are not wired")?;
@@ -217,7 +265,7 @@ impl Cluster {
     fn cpu(&self, core: usize) -> Result<&dyn Cpu, String> {
         self.cpus
             .get(core)
-            .map(|cpu| &**cpu)
+            .map(|cpu| cpu as &dyn Cpu)
             .ok_or_else(|| "Invalid ARMv7-A core".to_owned())
     }
     fn reg(&self, core: usize, register: Register) -> Result<u32, String> {
@@ -255,10 +303,8 @@ impl Cluster {
         )
     }
     fn fail(&self, core: usize, message: String) {
-        unsafe {
-            (*self.state.get()).failure = Some(message);
-            let _ = self.cpus[core].stop();
-        }
+        self.retain_failure(message);
+        let _ = self.cpus[core].stop();
     }
     fn redirect(&self, core: usize, pc: u32) -> Result<(), String> {
         unsafe {
@@ -295,12 +341,13 @@ impl Cluster {
         Ok(physical)
     }
     fn due(&self) {
+        if self.healthy().is_err() {
+            return;
+        }
         if let Err(error) = self.devices_due() {
-            unsafe {
-                (*self.state.get()).failure = Some(error);
-                for cpu in &self.cpus {
-                    let _ = cpu.stop();
-                }
+            self.retain_failure(error);
+            for cpu in &self.cpus {
+                let _ = cpu.stop();
             }
             return;
         }
@@ -424,6 +471,7 @@ unsafe fn memory_access(access: Access, address: u64, size: i32, value: i64, dat
     cluster.record_memory(hook.core, access, address, size, value);
 }
 fn instruction(c: &Cluster, core: usize, address: u64, size: u32) -> Result<(), String> {
+    c.healthy()?;
     c.record_memory(core, Access::Fetch, address, size as i32, 0);
     if let Some(guard) = unsafe { &mut (*c.state.get()).driver_guard } {
         // Check architecture before a return sentinel or IRQ can bypass the
@@ -450,6 +498,7 @@ fn instruction(c: &Cluster, core: usize, address: u64, size: u32) -> Result<(), 
         ));
     }
     c.due();
+    c.healthy()?;
     if unsafe { (*c.state.get()).remap_pending } && c.cp(core, 1, 0, 0, 0)? & 1 == 0 {
         unsafe {
             (*c.state.get()).remap_ready = true;
@@ -458,9 +507,6 @@ fn instruction(c: &Cluster, core: usize, address: u64, size: u32) -> Result<(), 
     }
     if unsafe { (*c.state.get()).cache_dirty } {
         return c.redirect(core, address as u32);
-    }
-    if let Some(error) = unsafe { (*c.state.get()).failure.as_ref() } {
-        return Err(error.clone());
     }
     if unsafe { (*c.state.get()).gic.next_irq(core).is_some() }
         && c.reg(core, arm::CPSR)? & 0x80 == 0
@@ -570,6 +616,8 @@ fn instruction(c: &Cluster, core: usize, address: u64, size: u32) -> Result<(), 
     if observed {
         let callback = c.pc_handler.borrow().as_ref().cloned();
         if let Some(callback) = callback {
+            c.observer_core.set(Some(core));
+            let _observing = Observing(&c.observer_core);
             callback(core, address)?;
         }
         if c.reg(core, arm::PC)? != address as u32 {
@@ -584,7 +632,7 @@ fn instruction(c: &Cluster, core: usize, address: u64, size: u32) -> Result<(), 
     {
         use fujimod_emulator::board::armv7a::Entry;
         if !matches!(
-            pmu.before(&*c.cpus[core], address, state.ticks)?,
+            pmu.before(&c.cpus[core], address, state.ticks)?,
             Entry::Execute
         ) {
             state.redirected = Some(address as u32 + 4);
@@ -767,6 +815,9 @@ fn instruction(c: &Cluster, core: usize, address: u64, size: u32) -> Result<(), 
 unsafe fn invalid(kind: Fault, address: u64, size: i32, _value: i64, data: *mut c_void) -> bool {
     let hook = unsafe { &*data.cast::<Hook>() };
     let c = unsafe { &*hook.cluster };
+    if c.healthy().is_err() {
+        return false;
+    }
     let discovery = unsafe { (*c.state.get()).discovery.enabled };
     let owned = unsafe {
         (*c.state.get())
@@ -812,6 +863,9 @@ unsafe fn invalid(kind: Fault, address: u64, size: i32, _value: i64, data: *mut 
 unsafe fn interrupt(exception: arm::Exception, data: *mut c_void) {
     let hook = unsafe { &*data.cast::<Hook>() };
     let c = unsafe { &*hook.cluster };
+    if c.healthy().is_err() {
+        return;
+    }
     let result = match exception {
         arm::Exception::PrefetchAbort => c.deliver_abort(hook.core, true),
         arm::Exception::DataAbort => c.deliver_abort(hook.core, false),
@@ -849,6 +903,9 @@ unsafe fn mmio_write(offset: u64, size: u32, value: u64, data: *mut c_void) {
 fn access(offset: u64, size: u32, write: bool, value: u64, data: *mut c_void) -> u64 {
     let hook = unsafe { &*data.cast::<MmioHook>() };
     let c = unsafe { &*hook.cluster };
+    if c.healthy().is_err() {
+        return 0;
+    }
     let address = hook.base + offset;
     if !(1..=8).contains(&size) {
         c.fail(hook.core, "Unsupported MMIO width".into());
@@ -929,8 +986,14 @@ pub struct Session {
 }
 pub type InstructionObserver = Rc<dyn Fn(usize, u64) -> Result<(), String>>;
 impl Session {
-    pub fn set_instruction_observer(&self, observer: Option<InstructionObserver>) {
+    pub fn set_instruction_observer(&self, observer: Option<InstructionObserver>) -> Result<(), String> {
+        self.inner.host_mutation()?;
         *self.inner.pc_handler.borrow_mut() = observer;
+        Ok(())
+    }
+
+    pub fn translation_maintenance_state(&self) -> Result<maintenance::Snapshot, String> {
+        self.inner.maintenance.snapshot(&self.inner.cpus)
     }
 
     pub fn ram_bytes(&self) -> usize {
@@ -942,6 +1005,8 @@ impl Session {
         card_files: Vec<(String, Vec<u8>)>,
     ) -> Result<Self, String> {
         let Definition {
+            byte_i2c,
+            xp4_jpeg,
             ram_size,
             cores,
             discovery,
@@ -949,10 +1014,13 @@ impl Session {
             initial_registers,
             labels,
             cbar,
+            gic_initial,
             timer_base,
             timer_layout,
             timer_routes,
+            discovery_tx_receiver,
             storage_jedec,
+            storage_immutable_prefix,
             standalone_dma,
             xp4_dma_sideband,
             storage_dma_routes,
@@ -1094,6 +1162,18 @@ impl Session {
         if !initial_registers.is_empty() && initial_registers.len() != cores {
             return Err("Initial ARM32 register sets must name every processor".into());
         }
+        let mut gic = Gic::new(cores, 512);
+        if let Some(initial) = gic_initial {
+            if cbar.is_none() { return Err("Initial GIC registers require an explicit CBAR".into()); }
+            initial.apply(&mut gic, cores)?;
+        }
+        // Check the optional byte-controller declarations before opening CPUs.
+        for input in &byte_i2c {
+            if !(32..512).contains(&input.irq) || input.base.checked_add(0x20).is_none_or(|end| end > 1 << 32) {
+                return Err("Invalid ARM32 byte I2C wiring".into());
+            }
+            fujimod_emulator_xp4_io::i2c::ByteI2c::new(input.base, input.irq, input.profile.clone(), input.peer.clone())?;
+        }
         let translation_cache_size_bytes =
             fujimod_emulator::board::factory::translation_cache_size_bytes(cores)?;
         let library = Library::linked()?;
@@ -1101,9 +1181,9 @@ impl Session {
             .map(|_| {
                 library
                     .open(cpu::Model::CortexA7, translation_cache_size_bytes)
-                    .map(|cpu| Box::new(cpu) as Box<dyn Cpu>)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let maintenance = maintenance::Maintenance::new(&cpus)?;
         let mut ledger = Discovery::default();
         ledger.enabled = discovery;
         let has_xpp_storage = xpp_storage.is_some();
@@ -1127,8 +1207,15 @@ impl Session {
         if storage_jedec.is_some() && xpp_storage.is_some() {
             return Err("XP4 and X-Processor Pro storage cannot be selected together".to_owned());
         }
+        if storage_immutable_prefix.is_some() && storage_jedec.is_none() {
+            return Err("Immutable NOR prefix requires an XP4 NOR owner".into());
+        }
+        if discovery_tx_receiver.is_some() && (!discovery || storage_jedec.is_none()) {
+            return Err("Transmit receiver input requires discovery and XP4 storage DMA".into());
+        }
+        let mut frozen_nor = None;
         let mut devices = if let Some(jedec) = storage_jedec {
-            Some(devices::Devices::storage(
+            let (devices, view) = devices::Devices::storage(
                 jedec,
                 storage_dma_routes,
                 storage_image.unwrap_or_default(),
@@ -1137,7 +1224,11 @@ impl Session {
                 storage_irq
                     .ok_or_else(|| "Serial flash requires an explicit IRQ route".to_owned())?,
                 xp4_dma_sideband,
-            )?)
+                discovery_tx_receiver,
+                storage_immutable_prefix.map(|p| fujimod_emulator_xp4_storage::storage::ImmutablePrefix::new(p.bytes)).transpose()?,
+            )?;
+            frozen_nor = view;
+            Some(devices)
         } else if let Some(storage) = xpp_storage {
             if !storage_dma_routes.is_empty() || storage_geometry.is_some() || storage_irq.is_some()
             {
@@ -1419,6 +1510,9 @@ impl Session {
                 .get_or_insert_with(devices::Devices::empty)
                 .dmp(base, irq)?;
         }
+        if let Some(law) = xp4_jpeg {
+            devices.get_or_insert_with(devices::Devices::empty).xp4_jpeg(law)?;
+        }
         for (base, pixel_ticks, first, second, layout, video) in lcdc {
             devices.get_or_insert_with(devices::Devices::empty).lcdc(
                 base,
@@ -1566,14 +1660,32 @@ impl Session {
                 .get_or_insert_with(devices::Devices::empty)
                 .decompressor(base, irq)?;
         }
+        for input in byte_i2c {
+            devices.get_or_insert_with(devices::Devices::empty).byte_i2c(input)?;
+        }
         let timer = timer_layout
             .map(|layout| timer::Timer::new(layout, &timer_routes))
             .transpose()?;
+        // Validate all physical owners before publishing any CPU mapping.
+        let mut owners = devices.as_ref().map_or_else(Vec::new, |d| d.guarded_windows());
+        owners.push((0, ram_size as u64));
+        if let Some(alias) = dram_alias { owners.push((alias, alias + ram_size as u64)); }
+        if let Some(base) = cbar { owners.push((base as u64 + 0x1000, base as u64 + 0x3000)); }
+        if let (Some(base), Some(timer)) = (timer_base, &timer) { owners.push((base as u64, base as u64 + timer.window())); }
+        for (i, &(lo, hi)) in owners.iter().enumerate() {
+            if hi > 1 << 32 || owners[..i].iter().any(|&(a,b)| lo < b && a < hi)
+                || memory.iter().any(|w| lo < w.base + w.data.len() as u64 && w.base < hi) {
+                return Err("Overlapping ARM32 physical owners".into());
+            }
+        }
+        if let Some(view) = &frozen_nor { devices.as_mut().unwrap().partition_nor_prefix(view.len()); }
         let mut inner = Box::new(Cluster {
             cpus,
+            maintenance,
             ram,
             dram_alias,
             memory,
+            frozen_nor,
             hooks: Vec::new(),
             labels,
             cbar,
@@ -1581,6 +1693,7 @@ impl Session {
             cache_ids,
             instruction_rate,
             running: Cell::new(false),
+            observer_core: Cell::new(None),
             pc_handler: RefCell::new(None),
             state: UnsafeCell::new(RunState {
                 instructions: 0,
@@ -1596,7 +1709,7 @@ impl Session {
                 redirected: None,
                 pages: BTreeMap::new(),
                 cbar_reads: 0,
-                gic: Gic::new(cores, 512),
+                gic,
                 timer,
                 irq_entries: vec![0; cores],
                 undefined_entries: vec![0; cores],
@@ -1629,6 +1742,7 @@ impl Session {
                 remap_pending: false,
                 remap_ready: false,
                 driver_guard: None,
+                driver_dma: None,
             }),
         });
         for core in 0..cores {
@@ -1661,6 +1775,14 @@ impl Session {
                         NonNull::new(inner.ram.as_ptr()).unwrap(),
                     )
                 }?;
+            }
+            if let Some(view) = &inner.frozen_nor {
+                // The view retains the canonical allocation until after all CPUs drop.
+                // NOR mutation admission and physical host writes protect these bytes.
+                unsafe { inner.cpus[core].map_frozen_backing(
+                    fujimod_emulator_xp4_storage::storage::FLASH, view.len(), 5,
+                    NonNull::new(view.as_ptr().cast_mut()).unwrap(),
+                ) }?;
             }
             for window in &inner.memory {
                 unsafe {
@@ -1753,19 +1875,26 @@ impl Session {
         store_limit: usize,
         core: usize,
     ) -> Result<(), String> {
+        self.inner.host_mutation()?;
         self.inner.cpu(core)?;
+        for &(lo, hi) in &executable {
+            let size = usize::try_from(hi.checked_sub(lo).ok_or("Invalid executable range")?).map_err(|_| "Executable span too large")?;
+            self.inner.memory_pointer(lo, size, 4)?;
+        }
         let state = unsafe { &mut *self.inner.state.get() };
+        if state.low_alias.is_some() || state.remap_pending || state.remap_ready || self.inner.dram_alias.is_some() {
+            return Err("Guarded calls require unaliased physical memory".into());
+        }
         if state.driver_guard.is_some()
             || state.discovery.enabled
             || state.failure.is_some()
-            || state.devices.is_some()
             || state.timer.is_some()
             || state.recorder.is_some()
             || state.memory_watch.is_some()
             || state.pc_observers.iter().any(|items| !items.is_empty())
         {
             return Err(
-                "Driver guard requires a healthy strict cluster without devices or observers"
+                "Driver guard requires a healthy strict cluster without active observers"
                     .to_owned(),
             );
         }
@@ -1775,7 +1904,7 @@ impl Session {
         self.inner
             .memory_pointer(return_address, 4, 4)
             .map_err(|_| "Driver guard return sentinel requires executable physical backing")?;
-        state.driver_guard = Some(driver_guard::Guard::new(
+        let mut guard = driver_guard::Guard::new(
             core,
             executable,
             readable,
@@ -1790,23 +1919,41 @@ impl Session {
                         .map(|window| (window.base, window.base + window.data.len() as u64)),
                 )
                 .collect(),
-        )?);
+        )?;
+        let device_windows = state.devices.as_ref().map_or_else(Vec::new, |d| d.guarded_windows());
+        guard.admit_mmio(device_windows.clone())?;
+        if !device_windows.is_empty() {
+            let snapshot = guard.snapshot();
+            if let Some(policy) = &state.driver_dma {
+                policy.require_same(&snapshot.readable, &snapshot.writable, store_limit)?;
+            } else {
+                state.driver_dma = Some(driver_dma::Policy::new(snapshot.readable, snapshot.writable, store_limit));
+            }
+        }
+        state.driver_guard = Some(guard);
         Ok(())
     }
-    pub fn driver_guard_end(&self) {
+    pub fn driver_guard_end(&self) -> Result<(), String> {
+        self.inner.host_mutation()?;
         unsafe {
             (*self.inner.state.get()).driver_guard = None;
         }
+        Ok(())
     }
     pub fn driver_guard_state(&self) -> Option<driver_guard::Snapshot> {
         unsafe {
             (*self.inner.state.get())
                 .driver_guard
                 .as_ref()
-                .map(|guard| guard.snapshot())
+                .map(|guard| {
+                    let mut snapshot = guard.snapshot();
+                    if let Some(policy) = &(*self.inner.state.get()).driver_dma { snapshot.dma_requests = policy.requests.clone(); }
+                    snapshot
+                })
         }
     }
     pub fn instruction_points(&self, core: usize, addresses: Vec<u64>) -> Result<(), String> {
+        self.inner.host_mutation()?;
         self.inner.cpu(core)?;
         if unsafe { (*self.inner.state.get()).driver_guard.is_some() } && !addresses.is_empty() {
             return Err("PC observers cannot change guarded routine inputs".to_owned());
@@ -1821,9 +1968,7 @@ impl Session {
         Ok(())
     }
     pub fn memory_watch_begin(&self, ranges: Vec<(u64, u64)>, limit: usize) -> Result<(), String> {
-        if self.inner.running.get() {
-            return Err("Memory watch requires a paused XP4 board".into());
-        }
+        self.inner.host_mutation()?;
         if ranges.is_empty()
             || ranges.len() > 256
             || limit == 0
@@ -1888,9 +2033,7 @@ impl Session {
         Ok(())
     }
     pub fn memory_watch_end(&self) -> Result<(), String> {
-        if self.inner.running.get() {
-            return Err("Memory watch requires a paused XP4 board".into());
-        }
+        self.inner.host_mutation()?;
         let Some(mut watch) = (unsafe { (*self.inner.state.get()).memory_watch.take() }) else {
             return Ok(());
         };
@@ -1917,6 +2060,7 @@ impl Session {
         return_sites: Option<Vec<u64>>,
         quota_per_edge: bool,
     ) -> Result<(), String> {
+        self.inner.host_mutation()?;
         if unsafe { (*self.inner.state.get()).driver_guard.is_some() } {
             return Err("Scalar recorder cannot attach during a guarded routine".to_owned());
         }
@@ -1933,10 +2077,12 @@ impl Session {
         }
         Ok(())
     }
-    pub fn function_watch_end(&self) {
+    pub fn function_watch_end(&self) -> Result<(), String> {
+        self.inner.host_mutation()?;
         unsafe {
             (*self.inner.state.get()).recorder = None;
         }
+        Ok(())
     }
     pub fn function_watch_state(&self) -> Option<observe::Snapshot> {
         unsafe {
@@ -1974,6 +2120,7 @@ impl Session {
         Ok(())
     }
     pub fn write(&self, address: usize, data: &[u8]) -> Result<(), String> {
+        self.inner.host_mutation()?;
         let target = self.inner.memory_pointer(address as u64, data.len(), 0)?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
@@ -2000,10 +2147,14 @@ impl Session {
     }
     pub fn run(&self, core: usize, budget: usize) -> Result<(), String> {
         let c = &self.inner;
+        c.healthy()?;
+        let cpu = c.cpu(core)?;
         if c.running.replace(true) {
             return Err("Reentrant ARMv7-A execution".to_owned());
         }
         let _running = Running(&c.running);
+        c.maintenance.ready(&c.cpus)
+            .map_err(|error| c.retain_failure(error))?;
         if budget == 0 && unsafe { (*c.state.get()).driver_guard.is_some() } {
             return Err("Guarded routine requires a positive instruction budget".to_owned());
         }
@@ -2015,52 +2166,55 @@ impl Session {
         } {
             return Ok(());
         }
-        c.flush_dma()?;
-        let cpu = c.cpu(core)?;
-        let start = c.reg(core, arm::PC)?;
-        unsafe {
-            (*c.state.get()).redirected = None;
-        }
-        let mut exit = cpu.run(Run {
-            begin: u64::from(start),
-            until: Some(u64::MAX),
-            watchdog_us: 0,
-            instructions: Some(budget),
-        });
-        // Unicorn reports disabled VFP as an invalid instruction rather than
-        // delivering ARM's undefined exception. Let the guest's vector enable
-        // and restore its FP context; never enable it from the host.
-        if matches!(&exit, Err(ExecutionError::InvalidInstruction(_)))
-            && unsafe { (*c.state.get()).failure.is_none() }
-        {
-            match c.disabled_vfp_exception(core) {
-                Ok(true) => exit = Ok(Exit::Stopped),
-                Ok(false) => (),
-                Err(error) => c.fail(core, error),
-            }
-        }
-        if let Some(pc) = unsafe { (*c.state.get()).redirected.take() } {
-            c.write_reg(core, arm::PC, pc)?;
-        }
-        if unsafe { (*c.state.get()).failure.is_none() } {
-            let failure = match exit {
-                Ok(Exit::Stopped) => None,
-                Ok(other) => Some(format!("Unexpected ARMv7-A execution exit {other:?}")),
-                Err(error) => Some(error.to_string()),
-            };
+        let result = (|| {
+            c.flush_dma()?;
+            let start = c.reg(core, arm::PC)?;
             unsafe {
-                (*c.state.get()).failure = failure;
+                (*c.state.get()).redirected = None;
             }
-        }
-        c.due();
-        c.flush_dma()?;
-        let state = unsafe { &mut *c.state.get() };
-        state.discovery.settle_trials(core, state.per_core[core]);
-        Ok(())
+            let mut exit = cpu.run(Run {
+                begin: u64::from(start),
+                until: Some(u64::MAX),
+                watchdog_us: 0,
+                instructions: Some(budget),
+            });
+            let raw_error = exit.as_ref().err().map(ToString::to_string);
+            c.maintenance.settle(&c.cpus, core, raw_error.as_deref())?;
+            c.healthy()?;
+            // Unicorn reports disabled VFP as an invalid instruction rather than
+            // delivering ARM's undefined exception. Let the guest's vector enable
+            // and restore its FP context; never enable it from the host.
+            if matches!(&exit, Err(ExecutionError::InvalidInstruction(_))) {
+                if c.disabled_vfp_exception(core)? {
+                    exit = Ok(Exit::Stopped);
+                }
+            }
+            match exit {
+                Ok(Exit::Stopped) => (),
+                Ok(other) => return Err(format!("Unexpected ARMv7-A execution exit {other:?}")),
+                Err(error) => return Err(error.to_string()),
+            };
+            if let Some(pc) = unsafe { (*c.state.get()).redirected.take() } {
+                c.write_reg(core, arm::PC, pc)?;
+            }
+            c.due();
+            c.healthy()?;
+            c.flush_dma()?;
+            let state = unsafe { &mut *c.state.get() };
+            state.discovery.settle_trials(core, state.per_core[core]);
+            Ok(())
+        })();
+        result.map_err(|error| c.retain_failure(error))
     }
     pub fn idle(&self) -> bool {
         let c = &self.inner;
+        if c.host_mutation().is_err() {
+            return false;
+        }
         c.due();
+        if c.healthy().is_err() {
+            return false;
+        }
         let state = unsafe { &mut *c.state.get() };
         if state.waiting.contains(&0) {
             return true;
@@ -2080,6 +2234,9 @@ impl Session {
             };
             state.ticks = at;
             c.due();
+            if c.healthy().is_err() {
+                return false;
+            }
             if unsafe { (*c.state.get()).waiting.contains(&0) } {
                 return true;
             }
@@ -2090,10 +2247,11 @@ impl Session {
     }
     pub fn set_adc_input(&self, channel: usize, sample: u16) -> Result<(), String> {
         let c = &self.inner;
+        c.host_mutation()?;
         if unsafe { (*c.state.get()).driver_guard.is_some() } {
             return Err("Guarded routine cannot change external ADC inputs".to_owned());
         }
-        c.devices_due()?;
+        c.devices_due().map_err(|error| c.retain_failure(error))?;
         let mut devices = unsafe { (*c.state.get()).devices.take() }
             .ok_or_else(|| "XP4 ADC is not wired".to_owned())?;
         let result = devices.set_adc_input(c, channel, sample);
@@ -2103,6 +2261,7 @@ impl Session {
         result
     }
     pub fn set_gpio_input(&self, port: usize, pin: usize, high: bool) -> Result<(), String> {
+        self.inner.host_mutation()?;
         let state = unsafe { &mut *self.inner.state.get() };
         if state.driver_guard.is_some() {
             return Err("Guarded routine cannot change external GPIO inputs".to_owned());

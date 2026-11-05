@@ -1,6 +1,7 @@
 //! Common Device/Host adapter owned by the Unicorn application CPU profile.
 //! Devices receive physical RAM, guest time and IRQ lines, never CPU state.
 use super::Cluster;
+use fujimod_emulator_cpu::Cpu;
 use fujimod_emulator_devices::graphics::scanout::Frame;
 use fujimod_emulator_devices::{Cx, Device, Host, Record};
 use fujimod_emulator_ip::usb::dwc3::{self, Dwc3};
@@ -95,6 +96,11 @@ impl Host for PhysicalHost<'_> {
         Ok(())
     }
     fn ram_read(&self, address: u64, out: &mut [u8]) -> Result<(), String> {
+        unsafe {
+            if let Some(policy) = &mut (*self.cluster.state.get()).driver_dma {
+                policy.check(address, out.len(), false)?;
+            }
+        }
         let source = self.cluster.memory_pointer(address, out.len(), 1)?;
         unsafe {
             std::ptr::copy_nonoverlapping(source, out.as_mut_ptr(), out.len());
@@ -102,6 +108,11 @@ impl Host for PhysicalHost<'_> {
         Ok(())
     }
     fn ram_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), String> {
+        unsafe {
+            if let Some(policy) = &mut (*self.cluster.state.get()).driver_dma {
+                policy.check(address, bytes.len(), true)?;
+            }
+        }
         let target = self.cluster.memory_pointer(address, bytes.len(), 2)?;
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len());
@@ -135,6 +146,25 @@ impl Host for PhysicalHost<'_> {
     }
 }
 impl Devices {
+    pub fn byte_i2c(&mut self, input: super::definition::ByteI2c) -> Result<(), String> {
+        if !(32..512).contains(&input.irq) || input.base.checked_add(0x20).is_none_or(|end| end > 1 << 32) {
+            return Err("Invalid ARM32 byte I2C wiring".into());
+        }
+        let model = fujimod_emulator_xp4_io::i2c::ByteI2c::new(input.base, input.irq, input.profile, input.peer)?;
+        let ranges = model.windows();
+        if ranges.iter().any(|&(a,b)| self.windows.iter().any(|&(lo,hi,_)| a < hi && lo < b)) {
+            return Err("Overlapping byte I2C window".into());
+        }
+        let id = self.models.len();
+        self.windows.extend(ranges.into_iter().map(|(a,b)| (a,b,id)));
+        self.models.push(Some(Box::new(model)));
+        Ok(())
+    }
+
+    pub fn guarded_windows(&self) -> Vec<(u64,u64)> {
+        let mut windows: Vec<_> = self.windows.iter().map(|&(lo,hi,_)| (lo,hi)).collect();
+        windows.sort_unstable(); windows
+    }
     pub fn set_adc_input(
         &mut self,
         c: &Cluster,
@@ -379,6 +409,22 @@ impl Devices {
         self.windows.push((base, base + 0x3000, id));
         Ok(())
     }
+    pub fn xp4_jpeg(&mut self, law: crate::definition::Xp4Jpeg) -> Result<(), String> {
+        use fujimod_emulator_xp4_codecs::jpeg::{Encoder, Packed422EncodingLaw, BASE, WINDOW, ADDRESS_HIGH};
+        let windows = [(BASE, BASE + WINDOW), (ADDRESS_HIGH, ADDRESS_HIGH + 8)];
+        if windows.iter().any(|&(base, end)| self.windows.iter().any(|&(lo, hi, _)| base < hi && lo < end)) {
+            return Err("Overlapping XP4 JPEG wiring".into());
+        }
+        let model = Encoder::new(Some(Packed422EncodingLaw {
+            raw_control_48: law.raw_control_48, raw_control_80: law.raw_control_80,
+            restart_mcus: law.restart_mcus, completion_ticks: law.completion_ticks,
+        }))?;
+        let id = self.models.len();
+        self.models.push(Some(Box::new(model)));
+        for (lo, hi) in windows { self.windows.push((lo, hi, id)); }
+        Ok(())
+    }
+
     pub fn lcdc(
         &mut self,
         base: u64,
@@ -665,6 +711,14 @@ impl Devices {
         self.models.push(Some(Box::new(model)));
         Ok(())
     }
+    pub fn partition_nor_prefix(&mut self, bytes: usize) {
+        for (lo, hi, _) in &mut self.windows {
+            if *lo == storage::FLASH && *hi == storage::FLASH + storage::FLASH_SIZE {
+                *lo += bytes as u64;
+            }
+        }
+        self.windows.retain(|(lo, hi, _)| lo < hi);
+    }
     pub fn storage(
         jedec: u32,
         routes: Vec<u32>,
@@ -672,7 +726,9 @@ impl Devices {
         geometry: (usize, usize, u64, u64),
         irq: u32,
         sideband: Option<storage::SidebandProfile>,
-    ) -> Result<Self, String> {
+        receiver_input: Option<super::definition::DiscoveryTxReceiver>,
+        prefix: Option<storage::ImmutablePrefix>,
+    ) -> Result<(Self, Option<storage::ImmutableView>), String> {
         let routes: [u32; 16] = routes
             .try_into()
             .map_err(|_| "XP4 DMA requires 16 physical IRQ routes")?;
@@ -682,7 +738,7 @@ impl Devices {
         if !(32..512).contains(&irq) {
             return Err("Invalid XP4 serial-flash IRQ".into());
         }
-        let port = storage::port(
+        let mut nor = storage::Nor::new(
             image,
             jedec,
             storage::Geometry {
@@ -692,10 +748,23 @@ impl Devices {
                 page_ticks: geometry.3,
             },
         )?;
-        Ok(Self {
+        if let Some(prefix) = prefix { nor = nor.with_immutable_prefix(prefix)?; }
+        let view = nor.immutable_view();
+        let port = storage::port_from_nor(nor);
+        let mut dma = DmaController::new(port.clone(), routes).with_sideband(sideband);
+        if let Some(input) = receiver_input {
+            if input.address < 0xff000000 {
+                return Err("Discovery transmit receiver requires a peripheral destination".into());
+            }
+            let mut receiver = fujimod_emulator_xp4_storage::tx_receiver::TxReceiver::new(input.address, input.request, input.capacity)?;
+            receiver.offer(input.offer_at, input.offer_bytes)?;
+            dma = dma.with_receiver(std::sync::Arc::new(std::sync::Mutex::new(receiver)));
+        }
+
+        Ok((Self {
             models: vec![
                 Some(Box::new(SerialFlashController::new(port.clone(), irq))),
-                Some(Box::new(DmaController::new(port, routes).with_sideband(sideband))),
+                Some(Box::new(dma)),
             ],
             events: Default::default(),
             log: Vec::new(),
@@ -716,7 +785,7 @@ impl Devices {
                 if sideband.is_some() { windows.push((storage::DMA_SIDEBAND, storage::DMA_SIDEBAND + 0x80, 1)); }
                 windows
             },
-        })
+        }, view))
     }
     /// X-Processor Pro flash controller, its read aperture and the PL330 that
     /// copies from it. The flash contents are an explicit board input.
@@ -1450,11 +1519,23 @@ impl Devices {
         Err("ARMv7-A device made no deadline progress".into())
     }
     pub fn snapshots(&self) -> std::collections::BTreeMap<String, String> {
-        self.models
-            .iter()
-            .flatten()
-            .map(|m| (m.name().into(), m.save().to_string()))
-            .collect()
+        let mut counts = BTreeMap::new();
+        for model in self.models.iter().flatten() {
+            *counts.entry(model.name()).or_insert(0usize) += 1;
+        }
+        let mut indices = BTreeMap::new();
+        self.models.iter().flatten().map(|model| {
+            let name = model.name();
+            let key = if counts[name] == 1 {
+                name.to_owned()
+            } else {
+                let index = indices.entry(name).or_insert(0usize);
+                let key = format!("{name}#{index}");
+                *index += 1;
+                key
+            };
+            (key, model.save().to_string())
+        }).collect()
     }
 }
 

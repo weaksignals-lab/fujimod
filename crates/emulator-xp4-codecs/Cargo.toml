@@ -1,0 +1,13 @@
+[package]
+name = "fujimod-emulator-xp4-codecs"
+description = "XP4 codec register transport with explicit encoding laws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+fujimod-emulator-devices.workspace = true
+fujimod-emulator-image-codecs.workspace = true
+fujimod-workspace-hack.workspace = true
